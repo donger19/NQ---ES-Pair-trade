@@ -1,0 +1,12 @@
+{
+  "symbolNQ": "CME_MINI:NQ1!",
+  "symbolES": "CME_MINI:ES1!",
+  "resolution": "3",
+  "historyBars": 5000,
+  "warmupBars": 1000,
+  "kalmanDelta": 1e-5,
+  "zWindow": 60,
+  "regimeWindow": 400,
+  "pollSeconds": 3,
+  "tradingviewToken": ""
+}
