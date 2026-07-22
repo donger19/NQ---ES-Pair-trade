@@ -1,5 +1,5 @@
 //@version=6
-indicator("NQ-ES Pair: Trend & Gap", shorttitle="NQ-ES Pair", overlay=false)
+indicator("NQ-ES Pair: Trend & Gap v3", shorttitle="NQ-ES Pair v3", overlay=false)
 
 // ── Inputs ──────────────────────────────────────────────────────────────
 sym1     = input.symbol("CME_MINI:NQ1!", "Asset 1 (NQ)")
@@ -9,21 +9,63 @@ zLen     = input.int(60,  "Residual z-score window",       minval=10)
 delta    = input.float(1e-5, "Kalman delta (state noise)", step=1e-6)
 rLambda  = input.float(0.99, "R forgetting factor",        step=0.005)
 showZ    = input.bool(true,  "Show Kalman residual z-score")
-zEntry   = input.float(2.0,  "Z entry band", step=0.25)
-showTbl  = input.bool(true,  "Show alpha/beta readout")
+showTbl  = input.bool(true,  "Show readout table")
 showTrnd = input.bool(true,  "Show projected trend lines")
 trendLen = input.int(100, "Trend regression lookback (bars)", minval=10)
 projBars = input.int(20,  "Projection distance (bars)",       minval=1)
-showRgm  = input.bool(true,  "Shade volatile regime",  group="Regime filter")
-volThr   = input.float(1.5, "Volatile vol-ratio threshold", step=0.1, group="Regime filter")
-calmOnly = input.bool(true,  "Alerts only in calm regime",   group="Regime filter")
 showFair = input.bool(true,  "Show fair-value line on price chart (alpha + beta*ES)")
-showSig  = input.bool(true,  "Show entry/exit markers",  group="Signals")
-zExit    = input.float(0.0, "Z exit level (take profit)", step=0.25, group="Signals")
-zStop    = input.float(4.0, "Z hard-stop level",          step=0.25, group="Signals")
-showVD   = input.bool(true,  "Show per-leg volume delta (σ)", group="Volume delta")
-vdTf     = input.timeframe("1", "Lower timeframe for delta",  group="Volume delta")
-vdLen    = input.int(60, "Delta normalization window", minval=10, group="Volume delta")
+showSig  = input.bool(true,  "Show entry/exit markers")
+
+G_RGM = "Regime filter"
+showRgm  = input.bool(true,  "Shade volatile regime",  group=G_RGM)
+volThr   = input.float(1.5, "Volatile vol-ratio threshold", step=0.1, group=G_RGM)
+calmOnly = input.bool(false, "Fade entries only in calm regime (off: rule-2 momentum veto governs)", group=G_RGM)
+
+// Rules 1-2: entry gate, spike confirmation, momentum veto
+G_ENTRY = "Entry rules (1-2)"
+zEntry      = input.float(2.0, "Entry gate |z| (no entries below this)", step=0.05, group=G_ENTRY)
+confirmBars = input.int(1, "Confirmation bars after breach (1 bar @ 1-min chart ~ 30-60s)", minval=0, group=G_ENTRY)
+velBars     = input.int(3, "Momentum lookback (bars)", minval=1, group=G_ENTRY)
+zVelMax     = input.float(1.0, "Max |z velocity| to allow fade", step=0.05, group=G_ENTRY)
+rocMax      = input.float(0.15, "Max |NQ ROC %| to allow fade", step=0.01, group=G_ENTRY)
+zStop       = input.float(4.0, "Hard-stop |z| (spread breaking, no fades armed beyond)", step=0.25, group=G_ENTRY)
+
+// Rule 3: chop / weak-signal filter
+G_CHOP = "Chop filter (3)"
+chopBand      = input.float(1.5, "Chop band |z|", step=0.05, group=G_CHOP)
+chopReversals = input.int(3, "Zero-crossings to call chop", minval=1, group=G_CHOP)
+chopWindow    = input.int(10, "Chop lookback (bars)", minval=2, group=G_CHOP)
+
+// Rule 4: risk & profit framework
+G_RISK = "Risk & exits (4)"
+maxRisk   = input.float(500.0, "Max risk per trade ($)", step=50, group=G_RISK)
+stopZ     = input.float(2.0, "Stop distance (z-units adverse from entry)", step=0.25, group=G_RISK)
+tpMode    = input.string("2R runner", "Take-profit mode", options=["2R runner", "Quick 1R"], group=G_RISK)
+zExit     = input.float(0.0, "Z exit level (mean reached)", step=0.25, group=G_RISK)
+consolBand = input.float(1.0, "Consolidation exit band |z|", step=0.05, group=G_RISK)
+consolBars = input.int(4, "Consecutive bars inside band to exit", minval=1, group=G_RISK)
+ptNQ  = input.float(20.0, "NQ $ per point",  group=G_RISK)
+ptES  = input.float(50.0, "ES $ per point",  group=G_RISK)
+ptMNQ = input.float(2.0,  "MNQ $ per point", group=G_RISK)
+ptMES = input.float(5.0,  "MES $ per point", group=G_RISK)
+
+// Rules 5-6: convergence arm / trend cross / intertwine
+G_CONV = "Convergence (5-6)"
+armDist        = input.float(0.15, "Arm distance |NQ-ES trend gap| (%)", step=0.01, group=G_CONV)
+convBars       = input.int(5, "Gap must be shrinking vs N bars ago", minval=1, group=G_CONV)
+intertwineBand = input.float(0.05, "Intertwine band |gap| (%)", step=0.01, group=G_CONV)
+intertwineBars = input.int(4, "Bars inside band = intertwined", minval=1, group=G_CONV)
+
+// Rule 8: manual ICT gap bias
+G_GAP = "ICT gap bias - manual (8)"
+gapDirIn  = input.string("none", "Nearest unmitigated gap direction", options=["none", "up", "down"], group=G_GAP)
+gapLevel  = input.price(0.0, "Gap level (NQ price, 0 = hide)", group=G_GAP)
+gapPolicy = input.string("block", "Counter-gap entry policy", options=["block", "half", "off"], group=G_GAP)
+
+G_VD = "Volume delta"
+showVD   = input.bool(true,  "Show per-leg volume delta (σ)", group=G_VD)
+vdTf     = input.timeframe("1", "Lower timeframe for delta",  group=G_VD)
+vdLen    = input.int(60, "Delta normalization window", minval=10, group=G_VD)
 
 // ── Data ────────────────────────────────────────────────────────────────
 nq = request.security(sym1, timeframe.period, close)
@@ -93,24 +135,234 @@ esDelta  = array.sum(esDeltaArr)
 nqDeltaZ = nqDelta / ta.stdev(nqDelta, vdLen)   // in sigmas, comparable to z
 esDeltaZ = esDelta / ta.stdev(esDelta, vdLen)
 
-// ── Entry/exit signals on the z bands ───────────────────────────────────
-// Enter when z crosses an entry band (calm regime only, if gated), exit
-// when it reverts to the exit level, hard-stop if it keeps stretching.
+// ── Rule inputs computed every bar ──────────────────────────────────────
+// momentum (rule 2): z velocity and underlying NQ rate-of-change
+zVel  = zScore - zScore[velBars]
+nqRoc = 100 * (nq / nq[velBars] - 1)
+momentumSettled = math.abs(zVel) <= zVelMax and math.abs(nqRoc) <= rocMax
+
+// chop (rule 3): >= chopReversals zero-crossings inside +/-chopBand over chopWindow
+zeroCross  = not na(zScore) and not na(zScore[1]) and ((zScore > 0 and zScore[1] <= 0) or (zScore < 0 and zScore[1] >= 0))
+crossCount = math.sum(zeroCross ? 1 : 0, chopWindow)
+maxAbsZ    = ta.highest(math.abs(zScore), chopWindow)
+isChop     = crossCount >= chopReversals and maxAbsZ < chopBand
+
+// convergence / intertwine (rules 5-6) on the normalized trend gap
+gapAbs      = math.abs(gap)
+converging  = gapAbs < armDist and gapAbs < math.abs(gap[convBars])
+intertwined = ta.highest(gapAbs, intertwineBars) < intertwineBand
+crossUp     = ta.crossover(normNQ, normES)
+crossDn     = ta.crossunder(normNQ, normES)
+trendCross  = crossUp or crossDn
+
+// directional context (rule 5/6): ES trend slope, gated by regime definition
+esFitBar   = ta.linreg(normES, trendLen, 0)
+esSlopeBar = esFitBar - ta.linreg(normES, trendLen, 1)
+regimeDefined = pVol < 0.40 or pVol > 0.60      // neutral band = stand down
+contextDir = not regimeDefined ? 0 : esSlopeBar < 0 ? -1 : esSlopeBar > 0 ? 1 : 0
+// contextDir -1 = bearish -> short NQ / long ES on cross; +1 = bullish mirror
+
 alertOk = not calmOnly or isCalm
-var int pos = 0    // +1 = long NQ / short ES, -1 = short NQ / long ES
-longEntry  = pos ==  0 and ta.crossunder(zScore, -zEntry) and alertOk
-shortEntry = pos ==  0 and ta.crossover(zScore,   zEntry) and alertOk
-exitLong   = pos ==  1 and ta.crossover(zScore,  -zExit)
-exitShort  = pos == -1 and ta.crossunder(zScore,  zExit)
-stopLong   = pos ==  1 and zScore <= -zStop
-stopShort  = pos == -1 and zScore >=  zStop
-if barstate.isconfirmed
-    if exitLong or exitShort or stopLong or stopShort
-        pos := 0
-    else if longEntry
-        pos := 1
-    else if shortEntry
-        pos := -1
+
+// ── Position sizing (rule 4) ────────────────────────────────────────────
+// Residual accrues in NQ points on the NQ leg; the beta-scaled ES leg
+// hedges the common move, so risk per 1 NQ pair-lot ~ stopPts * $/pt(NQ).
+stopPts   = stopZ * resSd
+nNQ       = stopPts > 0 ? math.floor(maxRisk / (stopPts * ptNQ)) : 0
+nMNQ      = stopPts > 0 ? math.floor(maxRisk / (stopPts * ptMNQ)) : 0
+useMicros = nNQ < 1
+nES       = math.max(1, math.round(nNQ * b * ptNQ / ptES))
+nMES      = math.max(1, math.round(nMNQ * b * ptMNQ / ptMES))
+riskUsed  = useMicros ? nMNQ * stopPts * ptMNQ : nNQ * stopPts * ptNQ
+tpR       = tpMode == "2R runner" ? 2.0 : 1.0
+
+// ── Signal state machine (replaces the v2 pos variable) ────────────────
+// 0 FLAT -> 1 CONVERGENCE_ARMED -> 2 SIGNAL_PENDING -> 3 IN_POSITION
+//        -> 4 TP_ZONE -> 0;  3 -> 5 REVERSAL_ELIGIBLE -> 0
+// Direct z-spike fades enter at SIGNAL_PENDING (no convergence prerequisite).
+var int   state        = 0
+var int   dir          = 0    // +1 long NQ / short ES, -1 short NQ / long ES
+var int   pendType     = 0    // 1 = z-fade breach, 2 = trend-cross trigger
+var int   confirmCount = 0
+var int   consolCount  = 0
+var float entryZv      = na
+var float entryPx      = na
+var float entryEs      = na
+var float entryBeta    = na
+var float entryStopPts = na
+var float entrySd      = na
+var bool  entryFade    = false   // true = z-fade entry through the rule-1 gate
+// fair value frozen at the breach/trigger bar: closed-bar innovations are
+// near-white (the filter absorbs each spike on the next update), so
+// confirmation must ask "is PRICE still stretched vs the fair value at
+// spike time?" - the same stretch the live forming-bar z displays
+var float frozenA      = na
+var float frozenB      = na
+var float frozenSd     = na
+var float stopLinePx   = na
+var float tgtLinePx    = na
+
+bool sigArm        = false
+bool sigPending    = false
+bool sigEnterLong  = false
+bool sigEnterShort = false
+bool sigExit       = false
+bool sigStop       = false
+bool sigReversal   = false
+bool sigGapBlocked = false
+float rExit        = na
+
+// live R multiple while in a position: pair P&L in price terms
+// (NQ leg minus beta-scaled ES leg, in NQ points, over the stop distance)
+rNow = (state == 3 or state == 5) and not na(entryPx) ?
+     dir * ((nq - entryPx) - entryBeta * (es - entryEs)) / entryStopPts : na
+
+if barstate.isconfirmed and not na(zScore) and not na(resSd)
+    // fade candidate from the entry gate (rule 1); no fades beyond zStop (rule 2)
+    breachDir = math.abs(zScore) >= zStop ? 0 : zScore >= zEntry ? -1 : zScore <= -zEntry ? 1 : 0
+
+    if state == 0   // FLAT
+        if breachDir != 0 and alertOk and not isChop
+            state := 2
+            dir := breachDir
+            pendType := 1
+            confirmCount := 0
+            frozenA := nq - zScore * resSd - b * es
+            frozenB := b
+            frozenSd := resSd
+            sigPending := true
+        else if contextDir != 0 and not isChop and (converging or intertwined)
+            state := 1
+            dir := contextDir
+            sigArm := true
+
+    else if state == 1   // CONVERGENCE_ARMED
+        if isChop or contextDir == 0 or contextDir != dir
+            state := 0
+            dir := 0
+        else if breachDir != 0 and alertOk
+            state := 2
+            dir := breachDir
+            pendType := 1
+            confirmCount := 0
+            frozenA := nq - zScore * resSd - b * es
+            frozenB := b
+            frozenSd := resSd
+            sigPending := true
+        else if dir == -1 ? crossUp : crossDn
+            // directional trigger only: bearish = NQ crossing UP into ES
+            // ("NQ trades up to ES; once they cross, NQ sells off hard")
+            state := 2
+            pendType := 2
+            confirmCount := 0
+            frozenA := nq - zScore * resSd - b * es
+            frozenB := b
+            frozenSd := resSd
+            sigPending := true
+        else if not (converging or intertwined)
+            state := 0
+            dir := 0
+
+    else if state == 2   // SIGNAL_PENDING (confirming, rule 2)
+        confirmCount := confirmCount + 1
+        zHold = (nq - (frozenA + frozenB * es)) / frozenSd
+        stillValid = pendType == 1 ?
+             (dir == -1 ? zHold >= zEntry and zHold < zStop : zHold <= -zEntry and zHold > -zStop) :
+             contextDir == dir
+        if isChop or not stillValid
+            state := 0
+            dir := 0
+            pendType := 0
+        else if confirmCount >= confirmBars and momentumSettled
+            aligned = gapDirIn == "none" or (dir == 1 and gapDirIn == "up") or (dir == -1 and gapDirIn == "down")
+            if not aligned and gapPolicy == "block"
+                sigGapBlocked := true
+                state := 0
+                dir := 0
+                pendType := 0
+            else
+                state := 3
+                entryZv := zHold
+                entryPx := nq
+                entryEs := es
+                entryBeta := frozenB
+                entryStopPts := stopZ * resSd
+                entrySd := frozenSd
+                entryFade := pendType == 1
+                consolCount := 0
+                stopLinePx := dir == -1 ? nq + stopZ * resSd : nq - stopZ * resSd
+                tgtLinePx  := dir == -1 ? nq - tpR * stopZ * resSd : nq + tpR * stopZ * resSd
+                sigEnterLong := dir == 1
+                sigEnterShort := dir == -1
+
+    else if state == 3   // IN_POSITION
+        // pair P&L in price terms: NQ leg minus beta-scaled ES leg (NQ pts)
+        resDelta = (nq - entryPx) - entryBeta * (es - entryEs)
+        rBar = dir * resDelta / entryStopPts
+        advCross = dir == 1 ? crossDn : crossUp
+        // z-reversion TP only for fade entries, measured vs the frozen
+        // entry fair value ("price actually reverted"), not the
+        // self-resetting rolling innovation z
+        zHoldNow = entryZv + resDelta / entrySd
+        zReverted = entryFade and (dir == -1 ? zHoldNow <= zExit : zHoldNow >= -zExit)
+        consolCount := math.abs(zScore) < consolBand ? consolCount + 1 : 0
+        if rBar <= -1.0 or math.abs(zScore) >= zStop
+            state := 0
+            sigStop := true
+            rExit := rBar
+            dir := 0
+        else if advCross
+            state := 5
+            sigReversal := true
+        else if rBar >= tpR or zReverted
+            state := 4
+            sigExit := true
+            rExit := rBar
+        else if consolCount >= consolBars or isChop
+            state := 0
+            sigExit := true
+            rExit := rBar
+            dir := 0
+
+    else if state == 4   // TP_ZONE (target hit last bar; go flat)
+        state := 0
+        dir := 0
+
+    else if state == 5   // REVERSAL_ELIGIBLE (adverse trend cross)
+        rBar = dir * ((nq - entryPx) - entryBeta * (es - entryEs)) / entryStopPts
+        sigExit := true
+        rExit := rBar
+        state := 0
+        dir := 0
+
+    if state == 0
+        stopLinePx := na
+        tgtLinePx := na
+        entryZv := na
+        entryPx := na
+        entryEs := na
+        entryBeta := na
+        entryStopPts := na
+        entrySd := na
+
+// R-multiple label on every close (rule 4 logging; authoritative log = MATLAB backtest)
+if showSig and not na(rExit)
+    label.new(bar_index, zScore, "R = " + str.tostring(rExit, "#.##"),
+         color=color.new(rExit >= 0 ? color.green : color.red, 70),
+         textcolor=rExit >= 0 ? color.green : color.red,
+         style=label.style_label_up, size=size.small)
+
+// flip guidance while reversal-eligible: does the manual gap agree with the new direction?
+revDir  = dir == 1 ? -1 : 1
+canFlip = state == 5 and gapDirIn != "none" and ((revDir == 1 and gapDirIn == "up") or (revDir == -1 and gapDirIn == "down"))
+
+// ── State visuals ───────────────────────────────────────────────────────
+color stCol = state == 1 ? color.new(color.yellow, 85) :
+     state == 2 ? color.new(color.orange, 82) :
+     state == 3 ? color.new(color.green, 86) :
+     state == 4 ? color.new(color.aqua, 82) :
+     state == 5 ? color.new(color.fuchsia, 82) : na
+bgcolor(stCol, title="Signal state")
 
 // ── Plots ───────────────────────────────────────────────────────────────
 plot(normNQ, "NQ trend", color=color.new(color.teal,   0), linewidth=2)
@@ -121,12 +373,10 @@ plot(gap, "Gap (NQ - ES, %)", style=plot.style_columns,
 plot(showZ ? zScore : na, "Kalman residual z", color=color.new(color.purple, 0))
 
 // Kalman mean line: fair NQ = alpha + beta*ES, drawn on the main price chart.
-// Meaningful when the chart symbol is NQ - price above the line = NQ rich.
 plot(showFair ? yhat : na, "Fair NQ (alpha + beta*ES)",
      color=color.new(color.aqua, 0), linewidth=2, force_overlay=true)
 
-// the z entry bands translated into price, flanking the mean line:
-// price at which the residual z-score would sit at +/- zEntry
+// the z entry bands translated into price, flanking the mean line
 upperPx = yhat + resMu + zEntry * resSd
 lowerPx = yhat + resMu - zEntry * resSd
 plot(showFair ? upperPx : na, "NQ rich band (+z)",
@@ -134,30 +384,48 @@ plot(showFair ? upperPx : na, "NQ rich band (+z)",
 plot(showFair ? lowerPx : na, "NQ cheap band (-z)",
      color=color.new(color.green, 35), linewidth=1, force_overlay=true)
 
+// live stop / target and manual gap level on the price chart
+plot(stopLinePx, "Stop (price est)", color=color.new(color.maroon, 20),
+     style=plot.style_linebr, force_overlay=true)
+plot(tgtLinePx, "Target (price est)", color=color.new(color.green, 20),
+     style=plot.style_linebr, force_overlay=true)
+plot(gapDirIn != "none" and gapLevel > 0 ? gapLevel : na, "Manual gap level",
+     color=color.new(color.blue, 30), style=plot.style_linebr, force_overlay=true)
+
 // entry/exit markers on the price chart
-plotshape(showSig and longEntry, "Enter: long NQ / short ES",
+plotshape(showSig and sigEnterLong, "Enter: long NQ / short ES",
      style=shape.triangleup, location=location.belowbar, size=size.small,
      color=color.new(color.green, 0), text="LONG NQ\nSHORT ES",
      textcolor=color.new(color.green, 0), force_overlay=true)
-plotshape(showSig and shortEntry, "Enter: short NQ / long ES",
+plotshape(showSig and sigEnterShort, "Enter: short NQ / long ES",
      style=shape.triangledown, location=location.abovebar, size=size.small,
      color=color.new(color.red, 0), text="SHORT NQ\nLONG ES",
      textcolor=color.new(color.red, 0), force_overlay=true)
-plotshape(showSig and (exitLong or exitShort), "Exit (mean reached)",
+plotshape(showSig and sigExit, "Exit pair trade",
      style=shape.xcross, location=location.abovebar, size=size.small,
      color=color.new(color.gray, 0), text="EXIT",
      textcolor=color.new(color.gray, 0), force_overlay=true)
-plotshape(showSig and (stopLong or stopShort), "Hard stop (spread breaking)",
+plotshape(showSig and sigStop, "Hard stop (spread breaking)",
      style=shape.xcross, location=location.abovebar, size=size.small,
      color=color.new(color.maroon, 0), text="STOP",
      textcolor=color.new(color.maroon, 0), force_overlay=true)
+plotshape(showSig and sigArm, "Convergence armed",
+     style=shape.circle, location=location.abovebar, size=size.tiny,
+     color=color.new(color.yellow, 0), force_overlay=true)
+plotshape(showSig and sigReversal, "Reversal eligible",
+     style=shape.diamond, location=location.abovebar, size=size.small,
+     color=color.new(color.fuchsia, 0), text="REV?",
+     textcolor=color.new(color.fuchsia, 0), force_overlay=true)
+
 plot(showVD ? nqDeltaZ : na, "NQ volume delta (σ)", style=plot.style_histogram,
      color=color.new(color.teal, 45), linewidth=2)
 plot(showVD ? esDeltaZ : na, "ES volume delta (σ)", style=plot.style_histogram,
      color=color.new(color.orange, 45), linewidth=2)
 hline(0, "Zero", color=color.new(color.gray, 50))
-upperBand = hline(zEntry,  "Z upper", color=color.new(color.red,   60), linestyle=hline.style_dotted)
-lowerBand = hline(-zEntry, "Z lower", color=color.new(color.green, 60), linestyle=hline.style_dotted)
+hline(zEntry,  "Z entry gate +", color=color.new(color.red,   60), linestyle=hline.style_dotted)
+hline(-zEntry, "Z entry gate -", color=color.new(color.green, 60), linestyle=hline.style_dotted)
+hline(chopBand,  "Chop band +", color=color.new(color.gray, 75), linestyle=hline.style_dashed)
+hline(-chopBand, "Chop band -", color=color.new(color.gray, 75), linestyle=hline.style_dashed)
 
 // ── Projected trend lines (linear regression, extended right) ──────────
 var line  nqTrend = na
@@ -167,7 +435,6 @@ var label nqLbl = na
 var label esLbl = na
 
 if showTrnd and barstate.islast
-    // current regression fit and per-bar slope for each series
     nqFit    = ta.linreg(normNQ, trendLen, 0)
     nqSlope  = nqFit - ta.linreg(normNQ, trendLen, 1)
     esFit    = ta.linreg(normES, trendLen, 0)
@@ -188,7 +455,6 @@ if showTrnd and barstate.islast
          bar_index, gapFit, extend=extend.right,
          color=color.new(color.gray, 40), style=line.style_dotted, width=1)
 
-    // projected levels `projBars` ahead
     nqProj = nqFit + nqSlope * projBars
     esProj = esFit + esSlope * projBars
     nqLbl := label.new(bar_index + projBars, nqProj,
@@ -200,29 +466,57 @@ if showTrnd and barstate.islast
          color=color.new(color.orange, 80), textcolor=color.orange,
          style=label.style_label_left, size=size.small)
 
-// ── Alpha/beta readout ──────────────────────────────────────────────────
-var table tbl = table.new(position.top_right, 2, 6, border_width=1,
+// ── Readout table ───────────────────────────────────────────────────────
+var table tbl = table.new(position.top_right, 2, 12, border_width=1,
      bgcolor=color.new(color.black, 20), frame_color=color.new(color.gray, 50))
 if showTbl and barstate.islast
     txtCol = color.white
+    stateName = state == 0 ? "FLAT" :
+         state == 1 ? "CONV ARMED" :
+         state == 2 ? "PENDING " + str.tostring(confirmCount) + "/" + str.tostring(confirmBars) :
+         state == 3 ? "IN POSITION" :
+         state == 4 ? "TP ZONE" : "REVERSAL?"
+    dirName = dir == 1 ? "LONG NQ / SHORT ES" : dir == -1 ? "SHORT NQ / LONG ES" : "-"
+    sizeTxt = useMicros ?
+         str.tostring(nMNQ) + " MNQ / " + str.tostring(nMES) + " MES" :
+         str.tostring(nNQ) + " NQ / " + str.tostring(nES) + " ES"
     table.cell(tbl, 0, 0, "beta",  text_color=txtCol, text_halign=text.align_left)
     table.cell(tbl, 1, 0, str.tostring(b, "#.####"), text_color=color.new(color.teal, 0))
     table.cell(tbl, 0, 1, "alpha", text_color=txtCol, text_halign=text.align_left)
     table.cell(tbl, 1, 1, str.tostring(a, "#.##"),   text_color=color.new(color.orange, 0))
     table.cell(tbl, 0, 2, "z",     text_color=txtCol, text_halign=text.align_left)
-    table.cell(tbl, 1, 2, str.tostring(zScore, "#.##"),
+    table.cell(tbl, 1, 2, str.tostring(zScore, "#.##") + (isChop ? "  CHOP" : momentumSettled ? "" : "  FAST"),
          text_color=math.abs(zScore) >= zEntry ? color.new(color.red, 0) : color.new(color.purple, 0))
     table.cell(tbl, 0, 3, "fair NQ", text_color=txtCol, text_halign=text.align_left)
     table.cell(tbl, 1, 3, str.tostring(yhat, "#.##"), text_color=color.new(color.aqua, 0))
     table.cell(tbl, 0, 4, "regime", text_color=txtCol, text_halign=text.align_left)
-    table.cell(tbl, 1, 4, (isCalm ? "Calm " : "Volatile ") + str.tostring(pVol * 100, "#") + "%",
+    table.cell(tbl, 1, 4, (isCalm ? "Calm " : "Volatile ") + str.tostring(pVol * 100, "#") + "%" + (regimeDefined ? "" : " (neutral)"),
          text_color=isCalm ? color.new(color.green, 0) : color.new(color.red, 0))
-    table.cell(tbl, 0, 5, "signal", text_color=txtCol, text_halign=text.align_left)
-    table.cell(tbl, 1, 5, pos == 1 ? "LONG NQ / SHORT ES" : pos == -1 ? "SHORT NQ / LONG ES" : "flat",
-         text_color=pos == 1 ? color.new(color.green, 0) : pos == -1 ? color.new(color.red, 0) : txtCol)
+    table.cell(tbl, 0, 5, "state", text_color=txtCol, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, stateName,
+         text_color=state == 3 ? color.new(color.green, 0) : state == 5 ? color.new(color.fuchsia, 0) : txtCol)
+    table.cell(tbl, 0, 6, "direction", text_color=txtCol, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, dirName,
+         text_color=dir == 1 ? color.new(color.green, 0) : dir == -1 ? color.new(color.red, 0) : txtCol)
+    table.cell(tbl, 0, 7, "size @ $" + str.tostring(maxRisk, "#"), text_color=txtCol, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, sizeTxt + " (risk $" + str.tostring(riskUsed, "#") + ")", text_color=txtCol)
+    table.cell(tbl, 0, 8, "stop / target", text_color=txtCol, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, str.tostring(stopPts, "#.#") + " pts / " + tpMode, text_color=txtCol)
+    table.cell(tbl, 0, 9, "R (live)", text_color=txtCol, text_halign=text.align_left)
+    table.cell(tbl, 1, 9, na(rNow) ? "-" : str.tostring(rNow, "#.##") + (state == 5 ? (canFlip ? "  flip->gap" : "  flatten") : ""),
+         text_color=na(rNow) ? txtCol : rNow >= 0 ? color.new(color.green, 0) : color.new(color.red, 0))
+    table.cell(tbl, 0, 10, "gap bias", text_color=txtCol, text_halign=text.align_left)
+    table.cell(tbl, 1, 10, gapDirIn == "none" ? "none" : gapDirIn + " @ " + str.tostring(gapLevel, "#.##") + " (" + gapPolicy + ")",
+         text_color=gapDirIn == "up" ? color.new(color.green, 0) : gapDirIn == "down" ? color.new(color.red, 0) : txtCol)
+    table.cell(tbl, 0, 11, "data", text_color=txtCol, text_halign=text.align_left)
+    table.cell(tbl, 1, 11, "chart feed (delayed ~10m without RT sub)", text_color=color.new(color.gray, 20))
 
-// alerts wired to the signal state machine
-alertcondition(shortEntry, "Enter: short NQ / long ES", "Z above entry band in calm regime: short NQ / long ES")
-alertcondition(longEntry,  "Enter: long NQ / short ES", "Z below entry band in calm regime: long NQ / short ES")
-alertcondition(exitLong or exitShort, "Exit pair trade",  "Z reverted to exit level: close the pair")
-alertcondition(stopLong or stopShort, "Hard stop",        "Z kept extending past stop level: relationship breaking, close the pair")
+// ── Alerts: one per state-machine transition ────────────────────────────
+alertcondition(sigArm,        "Convergence armed",            "Trend lines converging/intertwined with directional context: pending pair entry armed")
+alertcondition(sigPending,    "Signal pending (confirming)",  "Z breached the entry gate or trends crossed: confirming before entry")
+alertcondition(sigEnterShort, "Enter: short NQ / long ES",    "Confirmed entry: short NQ / long ES (check size table)")
+alertcondition(sigEnterLong,  "Enter: long NQ / short ES",    "Confirmed entry: long NQ / short ES (check size table)")
+alertcondition(sigExit,       "Exit pair trade",              "Exit: target / z-reversion / consolidation inside band - close the pair")
+alertcondition(sigStop,       "Hard stop",                    "Stop: 1R adverse or spread breaking - close the pair")
+alertcondition(sigReversal,   "Reversal eligible",            "Trend cross against the open position: flatten, or flip toward the manual gap if aligned")
+alertcondition(sigGapBlocked, "Entry blocked by gap policy",  "Confirmed signal was counter-gap and policy is block: no entry")
