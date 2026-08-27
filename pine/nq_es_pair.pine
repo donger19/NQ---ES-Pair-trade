@@ -27,12 +27,17 @@ calmOnly     = input.bool(false, "Fade entries only in calm regime (off: rule-2 
 // Frozen HMM parameters, fitted offline by MATLAB. Regenerate with
 // computeFeatures + RegimeDetector.paramsHMM and paste from config.json
 // (regimeParams). Pine cannot run EM, but it can filter with these.
-hmmP11     = input.float(0.98557, "HMM P(calm->calm)",     step=0.0001, group=G_RGM)
-hmmP22     = input.float(0.91411, "HMM P(vol->vol)",       step=0.0001, group=G_RGM)
-hmmMuCalm  = input.float(-0.0251, "HMM mu calm (NQ pts)",  step=0.001,  group=G_RGM)
-hmmSdCalm  = input.float(3.966,   "HMM sigma calm (NQ pts)", step=0.001, group=G_RGM)
-hmmMuVol   = input.float(-0.8709, "HMM mu volatile (NQ pts)", step=0.001, group=G_RGM)
-hmmSdVol   = input.float(14.445,  "HMM sigma volatile (NQ pts)", step=0.001, group=G_RGM)
+// Provenance: cfg.regimeParams.fittedOn = "5000 bars from 13-Jul-2026
+// 10:40:00 (log-log model)". These drifted out of sync once already - the
+// means were left at their price-space values after the log-log refit,
+// which moves pVolHMM and therefore contextDir. If you refit, repaste ALL
+// SIX here, at full precision, or parityCheck fails on px_pVolHMM.
+hmmP11     = input.float(0.9855740, "HMM P(calm->calm)",     step=0.0001, group=G_RGM)
+hmmP22     = input.float(0.9141093, "HMM P(vol->vol)",       step=0.0001, group=G_RGM)
+hmmMuCalm  = input.float(-0.0630071, "HMM mu calm (NQ pts)",  step=0.001,  group=G_RGM)
+hmmSdCalm  = input.float(3.9655973,  "HMM sigma calm (NQ pts)", step=0.001, group=G_RGM)
+hmmMuVol   = input.float(-2.1808142, "HMM mu volatile (NQ pts)", step=0.001, group=G_RGM)
+hmmSdVol   = input.float(14.4453667, "HMM sigma volatile (NQ pts)", step=0.001, group=G_RGM)
 
 // Rules 1-2: entry gate, spike confirmation, momentum veto
 G_ENTRY = "Entry rules (1-2)"
