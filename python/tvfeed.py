@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 
-from websocket import create_connection
+from websocket import WebSocketTimeoutException, create_connection
 
 WS_URL = "wss://prodata.tradingview.com/socket.io/websocket?from=chart"
 DEFAULT_TOKEN = "unauthorized_user_token"
@@ -86,6 +86,8 @@ class TViewAPI():
         self.ws = None
         # series id -> tradingview symbol string
         self.series_symbols = {}
+        # series id -> chart session that owns it (needed by request_more_data)
+        self.series_sessions = {}
 
     def generate_sesssion(self, session: bool) -> str:
         """
@@ -133,6 +135,7 @@ class TViewAPI():
                                     timeout=15)
         self.send_message("set_auth_token", [self.token])
         self.series_symbols = {}
+        self.series_sessions = {}
         # one chart session per symbol: unauthorized sessions are limited
         # to a single series each
         for i, symbol in enumerate(symbols, start=1):
@@ -140,6 +143,7 @@ class TViewAPI():
             symbol_id = f"symbol_{i}"
             series_id = f"sds_{i}"
             self.series_symbols[series_id] = symbol
+            self.series_sessions[series_id] = chart_session
             self.send_message("chart_create_session", [chart_session, ""])
             self.send_message("resolve_symbol", [
                 chart_session, symbol_id,
@@ -150,6 +154,16 @@ class TViewAPI():
                 chart_session, series_id, f"s{i}", symbol_id,
                 str(resolution), int(n_bars)
             ])
+
+    def request_more(self, series_id: str, n_bars: int):
+        """
+        Ask the server to extend `series_id` further back in time. Triggers
+        another round of timescale_update messages followed by a fresh
+        series_completed for that series.
+        """
+        self.send_message("request_more_data", [
+            self.series_sessions[series_id], series_id, int(n_bars)
+        ])
 
     def close(self):
         try:
@@ -167,7 +181,9 @@ class TViewAPI():
         Parse one payload. Returns:
           ("heartbeat", token)               keep-alive that must be echoed
           ("bars", {symbol: {ts: bar}})      history or live bar updates
-          ("series_completed", None)         initial history finished loading
+          ("series_completed", series_id)    a history page finished loading
+                                             (series_id may be None if the
+                                             server omits it)
           ("error", reason) / (None, None)   everything else
         """
         if payload.startswith("~h~"):
@@ -178,7 +194,11 @@ class TViewAPI():
             return None, None
         func = msg.get("m")
         if func == "series_completed":
-            return "series_completed", None
+            params = msg.get("p", [])
+            series_id = params[1] if len(params) > 1 else None
+            if not isinstance(series_id, str):
+                series_id = None
+            return "series_completed", series_id
         if func in ("critical_error", "protocol_error"):
             return "error", json.dumps(msg.get("p", []))
         if func not in ("timescale_update", "du"):
@@ -208,15 +228,37 @@ class TViewAPI():
 # One-shot history fetch (connect -> read until series completed -> close)
 # ----------------------------------------------------------------------
 def fetch_history(symbols, resolution="3", n_bars=5000, token=DEFAULT_TOKEN,
-                  timeout_s=30):
+                  timeout_s=180, start_ts=None, max_pages=40, verbose=False):
+    """
+    Fetch historical bars, optionally paging backwards past the single
+    create_series depth limit.
+
+    A create_series request returns at most one server-side page of history
+    (a few thousand bars). When `start_ts` (unix seconds) is given, each
+    series is extended with request_more_data until its oldest bar reaches
+    `start_ts`, the server stops receding, or `max_pages` is hit -- whichever
+    comes first. With `start_ts=None` the behaviour is the original
+    single-page fetch.
+
+    Anonymous sessions are depth-capped by TradingView, so reaching
+    `start_ts` is best-effort: always check the span of what comes back.
+    """
     api = TViewAPI(token)
     api.connect(symbols, resolution, n_bars)
     collected = {s: {} for s in symbols}
-    completed = 0
+    series_ids = list(api.series_symbols)
+    done = set()
+    pages = {sid: 0 for sid in series_ids}
+    oldest_seen = {sid: None for sid in series_ids}
+    # fallback when the server omits the series id on series_completed
+    anon_completions = 0
     deadline = time.time() + timeout_s
     try:
-        while completed < len(symbols) and time.time() < deadline:
-            raw = api.ws.recv()
+        while len(done) < len(series_ids) and time.time() < deadline:
+            try:
+                raw = api.ws.recv()
+            except WebSocketTimeoutException:
+                break
             for payload in api.split_frames(raw):
                 kind, data = api.parse_payload(payload)
                 if kind == "heartbeat":
@@ -224,10 +266,45 @@ def fetch_history(symbols, resolution="3", n_bars=5000, token=DEFAULT_TOKEN,
                 elif kind == "bars":
                     for sym, bars in data.items():
                         collected[sym].update(bars)
-                elif kind == "series_completed":
-                    completed += 1
                 elif kind == "error":
                     raise RuntimeError(f"TradingView error: {data}")
+                elif kind == "series_completed":
+                    sid = data
+                    if sid not in api.series_symbols:
+                        # Unattributable completion: fall back to counting.
+                        anon_completions += 1
+                        if anon_completions >= len(series_ids):
+                            done.update(series_ids)
+                        continue
+                    if sid in done:
+                        continue
+                    sym = api.series_symbols[sid]
+                    bars = collected[sym]
+                    oldest = min(bars) if bars else None
+                    prev = oldest_seen[sid]
+                    oldest_seen[sid] = oldest
+                    receding = (prev is None or
+                                (oldest is not None and oldest < prev))
+                    want_more = (start_ts is not None and
+                                 oldest is not None and
+                                 oldest > start_ts and
+                                 pages[sid] < max_pages and
+                                 receding)
+                    if want_more:
+                        pages[sid] += 1
+                        api.request_more(sid, n_bars)
+                        # progress was made: allow another full window
+                        deadline = time.time() + timeout_s
+                        if verbose:
+                            print(f"{sym}: page {pages[sid]}, "
+                                  f"{len(bars)} bars, oldest {oldest}",
+                                  flush=True)
+                    else:
+                        done.add(sid)
+                        if verbose:
+                            print(f"{sym}: done, {len(bars)} bars, "
+                                  f"oldest {oldest}, pages {pages[sid]}",
+                                  flush=True)
     finally:
         api.close()
     return {s: [collected[s][t] for t in sorted(collected[s])]
@@ -235,9 +312,11 @@ def fetch_history(symbols, resolution="3", n_bars=5000, token=DEFAULT_TOKEN,
 
 
 def fetch_history_json(symbols_csv, resolution="3", n_bars=5000,
-                       token=DEFAULT_TOKEN):
+                       token=DEFAULT_TOKEN, start_ts=0, max_pages=40):
     symbols = [s.strip() for s in str(symbols_csv).split(",") if s.strip()]
-    data = fetch_history(symbols, str(resolution), int(n_bars), str(token))
+    start = int(start_ts) if start_ts else None
+    data = fetch_history(symbols, str(resolution), int(n_bars), str(token),
+                         start_ts=start, max_pages=int(max_pages))
     return json.dumps(data)
 
 

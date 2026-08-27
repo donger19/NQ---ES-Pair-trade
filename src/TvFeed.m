@@ -32,14 +32,29 @@ classdef TvFeed < handle
             TvFeed.ensurePython();
         end
 
-        function tt = getHistory(obj, nBars)
+        function tt = getHistory(obj, nBars, opts)
+            %GETHISTORY Fetch historical bars as an aligned timetable.
+            %   nBars is the per-page depth. Pass StartDate to page
+            %   backwards past the single-request limit (a create_series
+            %   alone returns ~5000 bars); paging is best-effort because
+            %   anonymous sessions are depth-capped server-side.
             arguments
                 obj
                 nBars (1,1) double = 5000
+                opts.StartDate datetime = NaT
+                opts.MaxPages (1,1) double = 40
+            end
+            startTs = 0;
+            if ~isnat(opts.StartDate)
+                d = opts.StartDate;
+                if isempty(d.TimeZone)
+                    d.TimeZone = 'America/New_York';
+                end
+                startTs = floor(posixtime(d));
             end
             raw = char(py.tvfeed.fetch_history_json( ...
                 obj.symbolsCsv(), char(obj.Resolution), int32(nBars), ...
-                obj.tokenArg()));
+                obj.tokenArg(), int64(startTs), int32(opts.MaxPages)));
             data = jsondecode(raw);
             fn = fieldnames(data);
             for k = 1:numel(fn)

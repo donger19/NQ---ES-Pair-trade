@@ -1,20 +1,38 @@
 # NQ–ES Pair Trading Model (MATLAB, private/local)
 
-Models NQ as a time-varying regression on ES:
+Models NQ as a time-varying regression on ES, in **centered log space**:
 
 ```
-NQ_t = alpha_t + beta_t * ES_t + e_t
+log(NQ_t) = alpha_t + beta_t * (log(ES_t) - log(esRef)) + e_t
 ```
 
 | Term | Meaning | How it's computed |
 |---|---|---|
-| `alpha_t` | intercept / starting offset | Kalman filter state, updated every closed bar |
-| `beta_t` | hedge ratio — how strongly NQ moves with ES | Kalman filter state, updated every closed bar |
-| `e_t` | residual — the part of NQ the regression can't explain | innovation (actual NQ − predicted NQ), shown raw and as a rolling z-score |
+| `alpha_t` | log-space intercept | Kalman filter state, updated every closed bar |
+| `beta_t` | return elasticity (~1.64). Price-space hedge for the ES leg is `beta_t * NQ / ES` (~6.3) | Kalman filter state, updated every closed bar |
+| `e_t` | residual — the part of NQ the regression can't explain, **in NQ points** | innovation (actual NQ − predicted NQ), shown raw and as a rolling z-score |
 
-A 2-state Markov-switching model (Econometrics Toolbox) classifies the market
-regime — **Calm / mean-reverting** vs **Volatile / stressed** — from the
-residual series, with a volatility-ratio fallback if estimation fails.
+**Why log-log and centered.** The obvious price-space form
+`NQ = alpha + beta*ES` is *unidentified* on index data: `cond([1 ES]) ≈ 4e5`,
+so alpha and beta are collinear and the filter never leaves wherever it was
+seeded. The Pine indicator and the MATLAB backtest sat at beta 3.81 vs 6.02
+after 41,000 bars and disagreed on **4% of `|z|≥2` entry decisions** —
+permanently, because a chart's starting bar depends on how far you have
+scrolled, so identical seeding is not achievable on the chart even in
+principle. Centering the log regressor drops the condition number to ≈58,
+which makes the model identified: deliberately opposite seeds converge
+(beta 1.64432 vs 1.64480, z correlation 0.9998, agreeing on `|z|≥2` for
+99.93% of bars). That convergence is what makes the chart and the backtest
+the same model rather than two similar ones. Everything downstream stays in
+**NQ points**, so the rules, sizing and R-multiples are unchanged.
+
+Two regime models run side by side and the rules gate on their **agreement**:
+a 2-state Markov-switching HMM (Econometrics Toolbox fits it offline; MATLAB
+and Pine then both run the identical **causal forward filter** with those
+frozen parameters — Pine cannot run EM, but it can filter) and an EWMA
+volatility-ratio. The regime counts as *defined* only when both are decisive
+and they concur; otherwise the convergence path stands down. Both are causal
+by construction, so neither can look ahead.
 
 Data: TradingView websocket (`CME_MINI:NQ1!`, `CME_MINI:ES1!`), 1-minute bars,
 via a small Python bridge (`python/tvfeed.py`). Everything runs locally.
@@ -25,12 +43,45 @@ via a small Python bridge (`python/tvfeed.py`). Everything runs locally.
 cd 'C:\Users\luuka\OneDrive\Desktop\NQ - ES Pair trade'
 run_dashboard          % live dashboard (model outputs only, no signals)
 replay_demo            % offline replay/validation on cached history
-backtest_rules         % replay history through the v3 rule engine
+backtest_rules         % replay history through the v4 rule engine
 sweep_params           % walk-forward sweep: entry z x confirmation window
 runtests('tests')      % unit tests for every trading rule
 ```
 
+History is **extended in place** — bars already cached are never discarded,
+freshly fetched bars are merged in by timestamp:
+
+```matlab
+cfg  = jsondecode(fileread('config.json'));
+hist = loadPairHistory(pwd, cfg, 5000, ...
+         StartDate=datetime(2026,7,14,'TimeZone','America/New_York'));
+hist = loadPairHistory(pwd, cfg, 5000, Offline=true);   % never touches the network
+```
+
+A single `create_series` returns only ~5000 bars; `python/tvfeed.py` now pages
+backwards with `request_more_data`, which reached ~41,800 1-minute bars
+(6 weeks) on the anonymous feed in about 7 seconds.
+
 Close the dashboard window to stop the feed cleanly.
+
+## Proving the chart and the backtest agree
+
+`pine/nq_es_pair.pine` cannot run headlessly, so parity is proven by export
+and diff:
+
+1. In the indicator settings, enable **Parity export → Emit parity export
+   columns**.
+2. Chart must be `CME_MINI:NQ1!` / `CME_MINI:ES1!`, 1-minute, extended hours
+   on, scrolled left far enough to load the range you want compared.
+3. **File → Export chart data** → CSV.
+4. `rep = parityCheck('pine_export.csv')`
+
+`parityCheck` joins on timestamp and runs **Gate 0 first**: if the exported
+bars are not the cached bars, it stops and says so rather than reporting
+thousands of meaningless downstream mismatches. `state`, `dir`, `signal`,
+`gates`, `nNQ` and `nES` must match **exactly**; `z` within 5e-3. A column
+that is missing or all-NaN reports `SKIP`, not `PASS` — parity is only
+claimed over what was actually compared.
 
 ## The v3 rule set (journaled 2026-07-20/21, encoded in Pine + SignalEngine)
 

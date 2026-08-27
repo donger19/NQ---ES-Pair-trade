@@ -65,9 +65,107 @@ classdef RegimeDetector < handle
             out = obj.current();
         end
 
+        function prm = paramsHMM(obj)
+            %PARAMSHMM Frozen 2-state HMM parameters for the causal filter.
+            %   Exported so pine/nq_es_pair.pine can run the identical
+            %   forward recursion - Pine cannot estimate a Markov-switching
+            %   model, but it can filter with fixed parameters.
+            %   p11 = P(calm->calm), p22 = P(volatile->volatile).
+            prm = struct('valid', false, 'p11', 0.95, 'p22', 0.95, ...
+                'muCalm', 0, 'sdCalm', 1, 'muVol', 0, 'sdVol', 2);
+            if obj.Method ~= "markov" || isempty(obj.EstMdl)
+                return
+            end
+            P = obj.EstMdl.Switch.P;
+            vol = obj.VolatileState;
+            calm = 3 - vol;
+            mus = arrayfun(@(m) m.Constant, obj.EstMdl.Submodels);
+            sds = sqrt(arrayfun(@(m) m.Covariance, obj.EstMdl.Submodels));
+            prm.valid = true;
+            prm.p11 = P(calm, calm);
+            prm.p22 = P(vol, vol);
+            prm.muCalm = mus(calm);
+            prm.sdCalm = sds(calm);
+            prm.muVol = mus(vol);
+            prm.sdVol = sds(vol);
+        end
+
+        function p = filterHMM(obj, residuals, prm)
+            %FILTERHMM Causal 2-state Gaussian HMM forward filter.
+            %   p(k) depends only on residuals(1:k) - no smoothing, so no
+            %   lookahead. This is the recursion the Pine indicator mirrors.
+            if nargin < 3 || isempty(prm)
+                prm = obj.paramsHMM();
+            end
+            r = residuals(:);
+            n = numel(r);
+            p = nan(n, 1);
+            % start from the stationary distribution of the chain
+            denom = 2 - prm.p11 - prm.p22;
+            if denom > 0
+                aC = (1 - prm.p22) / denom;
+                aV = (1 - prm.p11) / denom;
+            else
+                aC = 0.5; aV = 0.5;
+            end
+            for k = 1:n
+                e = r(k);
+                if isnan(e)
+                    p(k) = aV;
+                    continue
+                end
+                % predict
+                pC = aC * prm.p11 + aV * (1 - prm.p22);
+                pV = aC * (1 - prm.p11) + aV * prm.p22;
+                % emission (the shared 1/sqrt(2*pi) cancels in normalisation)
+                lC = exp(-0.5 * ((e - prm.muCalm) / prm.sdCalm)^2) / prm.sdCalm;
+                lV = exp(-0.5 * ((e - prm.muVol) / prm.sdVol)^2) / prm.sdVol;
+                wC = pC * lC;
+                wV = pV * lV;
+                s = wC + wV;
+                if s > 0 && isfinite(s)
+                    aC = wC / s;
+                    aV = wV / s;
+                else
+                    aC = pC; aV = pV;   % degenerate: carry the prior forward
+                end
+                p(k) = aV;
+            end
+        end
+
+        function p = filterEwma(obj, residuals)
+            %FILTEREWMA Causal EWMA volatility-ratio pseudo-probability.
+            %   Mirrors pine/nq_es_pair.pine:121-126 exactly: EWMA variance
+            %   seeded with the first squared residual, robust sigma from a
+            %   trailing 400-bar median, logistic squash around VolThreshold.
+            r = residuals(:);
+            n = numel(r);
+            p = nan(n, 1);
+            med = movmedian(abs(r), [obj.Window - 1, 0], 'omitnan') * 1.4826;
+            v = NaN;
+            for k = 1:n
+                e = r(k);
+                if isnan(e)
+                    continue
+                end
+                if isnan(v)
+                    v = e * e;                       % Pine: na(ewmaVar) ? e*e
+                else
+                    v = 0.94 * v + 0.06 * e * e;
+                end
+                ratio = sqrt(v) / max(med(k), 1e-10);
+                p(k) = 1 / (1 + exp(-4 * (ratio - obj.VolThreshold)));
+            end
+        end
+
         function p = smoothAll(obj, residuals)
             %SMOOTHALL Volatile-state probability for a whole residual
             %   series in one pass (used for historical/backfill display).
+            %
+            %   WARNING - NOT CAUSAL. The markov branch runs a full-sample
+            %   smoother, so p(k) depends on residuals after k. Display and
+            %   diagnostics only. Never use it to drive a backtest: use
+            %   filterHMM/filterEwma instead.
             residuals = residuals(:);
             if obj.Method == "markov"
                 probs = smooth(obj.EstMdl, residuals);

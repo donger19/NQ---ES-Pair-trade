@@ -1,8 +1,9 @@
 function replay_demo(nBars, warmN)
 %REPLAY_DEMO Offline validation of the NQ-ES pair model.
-%   Fetches historical 3-minute bars from TradingView (cached locally),
-%   replays them bar-by-bar through the Kalman filter and regime detector,
-%   and plots the same outputs the live dashboard shows.
+%   Loads historical bars at cfg.resolution from the shared resolution-keyed
+%   cache (the same one backtest_rules uses), replays them bar-by-bar through
+%   the Kalman filter and regime detector, and plots the same outputs the
+%   live dashboard shows.
 %
 %   replay_demo          - replay 5000 bars, 500-bar warm-up
 %   replay_demo(N, W)    - custom history depth / warm-up length
@@ -16,24 +17,8 @@ root = fileparts(mfilename('fullpath'));
 addpath(fullfile(root, 'src'));
 cfg = loadConfig(root);
 
-% --- history (cached so replay works offline) -------------------------
-cacheFile = fullfile(root, 'data', 'history_cache.mat');
-maxAgeHours = 12;
-useCache = isfile(cacheFile);
-if useCache
-    info = dir(cacheFile);
-    useCache = (now - info.datenum) * 24 < maxAgeHours; %#ok<TNOW1>
-end
-if useCache
-    load(cacheFile, 'hist');
-    fprintf('Loaded %d cached bars (%s)\n', height(hist), cacheFile);
-else
-    feed = TvFeed(cfg);
-    hist = feed.getHistory(nBars);
-    if ~isfolder(fullfile(root, 'data')), mkdir(fullfile(root, 'data')); end
-    save(cacheFile, 'hist');
-    fprintf('Fetched and cached %d bars\n', height(hist));
-end
+% --- history (resolution-keyed cache, shared with backtest_rules) ------
+hist = loadPairHistory(string(root), cfg, nBars);
 
 % --- warm start --------------------------------------------------------
 kf = KalmanHedge();

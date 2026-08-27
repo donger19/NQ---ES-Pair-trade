@@ -64,7 +64,11 @@ classdef SignalEngine < handle
         function out = step(obj, bar)
             %STEP Process one CLOSED bar of features.
             %   bar: struct with t, nq, es, z, resSd, beta, normNQ, normES,
-            %        esSlope, pVol. Mirrors the barstate.isconfirmed block.
+            %        esSlope, and the regime pair pVolHMM/pVolEwma (a legacy
+            %        single pVol is still accepted). Optional spansGap
+            %        suppresses arming while lookback windows are refilling
+            %        after a session break. Mirrors the barstate.isconfirmed
+            %        block in pine/nq_es_pair.pine.
             p = obj.P;
             out = obj.emptyEvents();
 
@@ -113,16 +117,65 @@ classdef SignalEngine < handle
             obj.PrevNormNQ = bar.normNQ;
             obj.PrevNormES = bar.normES;
 
-            % directional context: neutral regime band = stand down
-            if bar.pVol >= 0.40 && bar.pVol <= 0.60
-                contextDir = 0;                    % neutral regime: stand down
+            % --- regime: the two models must AGREE before context is used --
+            % pVolHMM  : causal 2-state HMM forward filter
+            % pVolEwma : EWMA vol-ratio (the Pine fallback)
+            % Either model landing in the neutral band, or the two of them
+            % disagreeing on calm-vs-volatile, means the regime is undefined
+            % and the convergence path stands down. Mirrors pine:159-162.
+            [pHMM, pEwma] = obj.regimeInputs(bar);
+            defHMM = pHMM < 0.40 || pHMM > 0.60;
+            defEwma = pEwma < 0.40 || pEwma > 0.60;
+            agree = (pHMM >= 0.5) == (pEwma >= 0.5);
+            regimeDefined = defHMM && defEwma && agree;
+            if regimeDefined
+                contextDir = sign(bar.esSlope);   % <0 bearish -> short NQ / long ES
             else
-                contextDir = sign(bar.esSlope);    % <0 bearish -> short NQ / long ES
+                contextDir = 0;
             end
-            isCalm = bar.pVol < 0.5;
+            isCalm = agree && pHMM < 0.5;
             alertOk = ~p.calmOnly || isCalm;
 
-            if isnan(bar.z) || isnan(bar.resSd) || bar.resSd <= 0
+            % A gap (CME halt, weekend) invalidates every lookback window,
+            % so nothing arms or confirms until the windows refill.
+            if isfield(bar, 'spansGap') && bar.spansGap
+                momentumSettled = false;
+                contextDir = 0;
+                regimeDefined = false;
+            end
+
+            % --- why-no-entry gate mask (mirrors the Pine gateMask) -------
+            % Computed before the early return so a warming-up bar still
+            % reports a reason. Bit values live in parityCodes().
+            warmup = isnan(bar.z) || isnan(bar.resSd) || bar.resSd <= 0;
+            zv = NaN; roc = NaN;
+            if nZ > p.velBars
+                zv = obj.Zh(end) - obj.Zh(end-p.velBars);
+                roc = 100 * (obj.NQh(end) / obj.NQh(end-p.velBars) - 1);
+            end
+            aligned = strcmp(p.gapDir, 'none') || ...
+                (obj.Dir == 1 && strcmp(p.gapDir, 'up')) || ...
+                (obj.Dir == -1 && strcmp(p.gapDir, 'down'));
+            g = parityCodes().gate;
+            gates = 0;
+            if ~warmup && abs(bar.z) < p.entryZ,      gates = gates + g.zInside;  end
+            if ~warmup && abs(bar.z) >= p.zHardStop,  gates = gates + g.beyondHS; end
+            if isChop,                                gates = gates + g.chop;     end
+            if ~isnan(zv) && abs(zv) > p.zVelMax,     gates = gates + g.zVel;     end
+            if ~isnan(roc) && abs(roc) > p.rocMax,    gates = gates + g.roc;      end
+            if ~regimeDefined,                        gates = gates + g.regime;   end
+            if p.calmOnly && ~isCalm,                 gates = gates + g.calmVeto; end
+            if ~aligned && strcmp(p.gapPolicy,'block'), gates = gates + g.gapBlock; end
+            if obj.State == 2 && obj.ConfirmCount < p.confirmBars
+                gates = gates + g.confirm;
+            end
+            if warmup,                                gates = gates + g.warmup;   end
+            if ~(converging || intertwined),          gates = gates + g.noConv;   end
+            if obj.State >= 3,                        gates = gates + g.inPos;    end
+            out.gates = gates;
+            out.blockReason = SignalEngine.reasonFromGates(gates, obj.ConfirmCount, p);
+
+            if warmup
                 out.state = obj.State; out.dir = obj.Dir;
                 out.stateName = obj.stateName();
                 return
@@ -295,6 +348,23 @@ classdef SignalEngine < handle
             obj.State = 3;
         end
 
+        function [pHMM, pEwma] = regimeInputs(~, bar)
+            %REGIMEINPUTS Both regime probabilities for this bar.
+            %   Prefers the two-model fields emitted by computeFeatures. A
+            %   bar carrying only the legacy single pVol is treated as both
+            %   models agreeing on that value, which keeps older fixtures
+            %   and the dashboard working unchanged.
+            if isfield(bar, 'pVolHMM') && isfield(bar, 'pVolEwma')
+                pHMM = bar.pVolHMM;
+                pEwma = bar.pVolEwma;
+            else
+                pHMM = bar.pVol;
+                pEwma = bar.pVol;
+            end
+            if isnan(pHMM), pHMM = 0.5; end
+            if isnan(pEwma), pEwma = 0.5; end
+        end
+
         function freezeFair(obj, bar)
             %FREEZEFAIR Pin the fair value at the breach/trigger bar.
             %   Derived so that zHold at this bar equals the current z
@@ -373,6 +443,42 @@ classdef SignalEngine < handle
     end
 
     methods (Static)
+        function r = reasonFromGates(gates, confirmCount, p)
+            %REASONFROMGATES First blocking gate, in a fixed priority order.
+            %   One actionable sentence rather than a bitmask. The order and
+            %   the wording mirror `blockReason` in nq_es_pair.pine so the
+            %   chart and a backtest post-mortem say the same thing.
+            g = parityCodes().gate;
+            has = @(bit) bitand(gates, bit) ~= 0;
+            if has(g.warmup)
+                r = "warming up (resSd)";
+            elseif has(g.inPos)
+                r = "in position";
+            elseif has(g.beyondHS)
+                r = sprintf("beyond hard stop |z|>=%.1f", p.zHardStop);
+            elseif has(g.chop)
+                r = "chop filter active";
+            elseif has(g.confirm)
+                r = sprintf("confirming %d/%d", confirmCount, p.confirmBars);
+            elseif has(g.zInside)
+                r = sprintf("z inside gate (|z|<%.2f)", p.entryZ);
+            elseif has(g.zVel)
+                r = "z velocity too fast";
+            elseif has(g.roc)
+                r = "NQ ROC too fast";
+            elseif has(g.gapBlock)
+                r = "counter-gap blocked";
+            elseif has(g.calmVeto)
+                r = "calmOnly veto";
+            elseif has(g.regime)
+                r = "regime undefined/disagree";
+            elseif has(g.noConv)
+                r = "no convergence";
+            else
+                r = "ready";
+            end
+        end
+
         function s = positionSize(maxRiskUSD, stopPts, beta, p)
             %POSITIONSIZE Contracts from $ risk and stop distance (rule 4).
             %   Risk per 1 NQ pair-lot ~ stopPts * $/pt(NQ); the beta-scaled
